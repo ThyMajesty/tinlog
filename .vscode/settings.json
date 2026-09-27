@@ -1,0 +1,6 @@
+{
+    "cmake.configureSettings": {
+        "TINLOG_BUILD_EXAMPLE": "ON"
+    },
+    "cmake.buildTarget": "tinlog_example"
+}
