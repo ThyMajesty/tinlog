@@ -1,4 +1,4 @@
-#include "include/tinlog/tinlog.h"
+#include "include/tinlog.h"
 
 #include <string>
 
