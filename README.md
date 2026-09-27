@@ -33,7 +33,7 @@ Or via `FetchContent`:
 include(FetchContent)
 FetchContent_Declare(
     tinlog
-    GIT_REPOSITORY https://github.com/yourname/tinlog.git
+    GIT_REPOSITORY https://github.com/thymajesty/tinlog.git
     GIT_TAG main
 )
 FetchContent_MakeAvailable(tinlog)
