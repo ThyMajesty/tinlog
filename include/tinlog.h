@@ -1,7 +1,11 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -9,18 +13,57 @@
 #include <memory>
 #include <print>
 #include <source_location>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+#include <cstdlib>
+
+namespace color_details {
+// Resolving env and adopting NO_COLOR for the terminal sinc
+// and maybe other streams
+inline bool autoColorFor(std::FILE* f) {
+    // https://no-color.org: present and non-empty disables color
+    if (const char* nc = std::getenv("NO_COLOR"); nc && *nc)
+        return false;
+    // check for term
+    if (const char* term = std::getenv("TERM"); term && std::string_view(term) == "dumb")
+        return false;
+#if defined(_WIN32)
+    return _isatty(_fileno(f)) != 0;
+#else
+    return isatty(fileno(f)) != 0;
+#endif
+}
+} // namespace color_details
+
+// We still have to define the numerical representation of each level manually,
+// since we want to have preprocessor taking care of call sites definitions
 #define TINLOG_LEVEL_TRACE 0
 #define TINLOG_LEVEL_DEBUG 1
 #define TINLOG_LEVEL_INFO 2
 #define TINLOG_LEVEL_WARN 3
 #define TINLOG_LEVEL_ERROR 4
 #define TINLOG_LEVEL_CRITICAL 5
+// Sentinel
 #define TINLOG_LEVEL_OFF 6
 
+// X(id, ID, NUM, name, color) - utility for enum typecheck, names and colors
+#define TINLOG_LEVELS(X)                                                                                               \
+    X(Trace, TRACE, TINLOG_LEVEL_TRACE, "TRACE", "\033[90m")                                                           \
+    X(Debug, DEBUG, TINLOG_LEVEL_DEBUG, "DEBUG", "\033[36m")                                                           \
+    X(Info, INFO, TINLOG_LEVEL_INFO, "INFO", "\033[32m")                                                               \
+    X(Warn, WARN, TINLOG_LEVEL_WARN, "WARN", "\033[33m")                                                               \
+    X(Error, ERROR, TINLOG_LEVEL_ERROR, "ERROR", "\033[31m")                                                           \
+    X(Critical, CRITICAL, TINLOG_LEVEL_CRITICAL, "CRIT", "\033[1;41;97m")
+
+// Either defined at compile-time/before tinlog.h included, or deduced the default from NDEBUG
 #ifndef TINLOG_LEVEL
 #ifdef NDEBUG
 #define TINLOG_LEVEL TINLOG_LEVEL_INFO
@@ -29,22 +72,52 @@
 #endif
 #endif
 
-//TODO: threading, thread safety
-
+// TODO: threading, thread safety
 namespace tinlog {
 
-using LogLevel = int;
-
-constexpr std::array<std::string_view, 6> kLevelNames = {
-    "TRACE", "DEBUG", "INFO ", "WARN ", "ERROR", "CRIT ",
+enum class LogLevel : std::uint8_t {
+#define X(id, ID, NUM, name, color) id = NUM,
+    TINLOG_LEVELS(X)
+#undef X
+    // Sentinel
+    Off
 };
 
-constexpr std::array<std::string_view, 6> kLevelColors = {
-    "\033[90m", "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[1;41;97m",
+// We rely on sentinel being the last element of each representation
+// Check the enumeration consistency, not needed tbh...
+inline constexpr size_t kLevelCount = static_cast<size_t>(LogLevel::Off);
+constexpr bool levelsAreDense() {
+    size_t i = 0;
+    bool ok = true;
+#define X(id, ID, NUM, name, color) ok = ok && (static_cast<size_t>(NUM) == i++);
+    TINLOG_LEVELS(X)
+#undef X
+    return ok;
+}
+static_assert(levelsAreDense(), "TINLOG_LEVELS must be dense and ordered from 0");
+static_assert(TINLOG_LEVEL_OFF == kLevelCount, "TINLOG_LEVEL_OFF must follow the last level");
+
+inline constexpr std::array<std::string_view, kLevelCount> kDefaultNames = {
+#define X(id, ID, NUM, name, color) name,
+    TINLOG_LEVELS(X)
+#undef X
 };
 
-constexpr std::string_view levelColor(LogLevel lvl) {
-    return kLevelColors[lvl];
+inline constexpr std::array<std::string_view, kLevelCount> kDefaultColors = {
+#define X(id, ID, NUM, name, color) color,
+    TINLOG_LEVELS(X)
+#undef X
+};
+
+constexpr size_t lvl2idx(LogLevel lvl) {
+    assert(lvl < LogLevel::Off && "invalid LogLevel");
+    return static_cast<size_t>(lvl);
+}
+constexpr std::string_view getLevelName(LogLevel lvl) {
+    return kDefaultNames[lvl2idx(lvl)];
+}
+constexpr std::string_view getLevelColor(LogLevel lvl) {
+    return kDefaultColors[lvl2idx(lvl)];
 }
 constexpr std::string_view colorReset() {
     return "\033[0m";
@@ -57,25 +130,33 @@ struct LogMessage {
     std::chrono::system_clock::time_point timestamp;
 };
 
+enum class ColorMode : std::uint8_t { Never, Always, Auto };
+
 // Per-sink formatting config
 // TODO: timestamp flooring to a specified precision instead of milliseconds (std::chrono::seconds, ..)
 struct LogFormat {
-    bool useColor = false;
+    ColorMode color = ColorMode::Auto;
 
     // chrono format spec, applied to the timestamp floored to milliseconds.
     std::string timestampFormat = "%Y-%m-%d %H:%M:%S";
+    // cached timeZone - can be changed on the call site
+    const std::chrono::time_zone* timeZone = std::chrono::current_zone();
 
     // Positional: {0} file, {1} line, {2} function.
     std::string sourceFormat = "File: {0} {2}:{1}";
 
     // Final assembly. Positional args are *already-rendered* pieces:
-    //   {0} color escape (empty if useColor == false)
+    //   {0} color escape (empty if color is disabled by ColorMode/env)
     //   {1} rendered timestamp
-    //   {2} level name (padded)
+    //   {2} level name
     //   {3} user message
-    //   {4} color reset escape (empty if useColor == false)
+    //   {4} color reset escape (empty if color is disabled by ColorMode/env)
     //   {5} rendered source
-    std::string pattern = "{0}[{1}] [{2}] {3}{4} ({5})";
+    std::string pattern = "{0}[{1}] [{2:^5}] {3}{4} ({5})";
+
+    // Appended after the rendered pattern. Not a part of the pattern, so
+    // it never goes through std::vformat.
+    std::string terminator = "\n";
 };
 
 class LogSink {
@@ -94,14 +175,33 @@ public:
     }
 
 protected:
-    std::string render(const LogMessage& msg) const {
-        std::string_view color = m_format.useColor ? levelColor(msg.level) : std::string_view {};
-        std::string_view reset = m_format.useColor ? colorReset() : std::string_view {};
-        std::string_view levelName = kLevelNames[msg.level];
+    // autoValue: what Auto means for the target about to be written to
+    bool resolveColor(bool autoValue) const {
+        switch (m_format.color) {
+        case ColorMode::Always:
+            return true;
+        case ColorMode::Auto:
+            return autoValue;
+        case ColorMode::Never:
+            return false;
+        }
+        return false;
+    }
+
+    // We have several overrides for the color
+    // env vars such as NO_COLOR - will set autoValue for the color to false for teminal depending on the stream and evn
+    // characteristics. overrides per sink two levers ColorMode::Always/Never - user controlled - ignore all the
+    // resolving logic.
+    std::string render(const LogMessage& msg, bool useColor) const {
+        std::string_view color = useColor ? getLevelColor(msg.level) : std::string_view {};
+        std::string_view reset = useColor ? colorReset() : std::string_view {};
+        std::string_view levelName = getLevelName(msg.level);
 
         auto timestamp = std::chrono::floor<std::chrono::milliseconds>(msg.timestamp);
+        // Convert timestamp to current zone
+        auto zonedTimestamp = std::chrono::zoned_time { m_format.timeZone, timestamp };
         std::string renderedTimestamp =
-            std::vformat("{:" + m_format.timestampFormat + "}", std::make_format_args(timestamp));
+            std::vformat("{:" + m_format.timestampFormat + "}", std::make_format_args(zonedTimestamp));
 
         auto sourceFileName = msg.location.file_name();
         auto sourceLine = msg.location.line();
@@ -109,69 +209,113 @@ protected:
         std::string renderedSource =
             std::vformat(m_format.sourceFormat, std::make_format_args(sourceFileName, sourceLine, sourceFunctionName));
 
-        return std::vformat(
+        auto out = std::vformat(
             m_format.pattern,
             std::make_format_args(color, renderedTimestamp, levelName, msg.rawMessage, reset, renderedSource)
         );
+        out += m_format.terminator;
+        return out;
     }
 
     LogFormat m_format;
 };
 
-// TODO: check the env we are currently in and strip color accordingly
 class TerminalSink final : public LogSink {
+private:
+    LogLevel m_stderrThreshold = LogLevel::Error;
+    bool m_outColor;
+    bool m_errColor;
+
 public:
-    explicit TerminalSink(LogFormat format = { .useColor = true }) : LogSink(std::move(format)) {}
+    explicit TerminalSink(LogFormat format = {})
+        : LogSink(std::move(format)), m_outColor(color_details::autoColorFor(stdout)),
+          m_errColor(color_details::autoColorFor(stderr)) {}
+
+    // Messages with level >= threshold go to stderr, the rest to stdout.
+    // LogLevel::Off = everything to stdout, LogLevel::Trace = everything to stderr.
+    void setStderrThreshold(LogLevel lvl) {
+        m_stderrThreshold = lvl;
+    }
 
     void write(const LogMessage& message) override {
-        std::println("{}", render(message));
+        const bool toErr = message.level >= m_stderrThreshold;
+        if (toErr)
+            // avoid missalingment between buffered stdout and unbeffered stderr
+            std::fflush(stdout);
+        std::print(toErr ? stderr : stdout, "{}", render(message, resolveColor(toErr ? m_errColor : m_outColor)));
     }
+};
+
+enum class FileMode : std::uint8_t {
+    Truncate,
+    Append,
 };
 
 // TODO: Proper aliasing
 // TODO: Rotating files, backlog (/old/%timestamp%.log)
 class FileSink final : public LogSink {
-public:
-    explicit FileSink(const std::filesystem::path& path, LogFormat format = {})
-        : LogSink(std::move(format)), m_file(open(path)) {}
-
-    void write(const LogMessage& message) override {
-        std::println(m_file, "{}", render(message));
-        m_file.flush();
-    }
+private:
+    FileMode m_fileMode = FileMode::Truncate;
+    std::ofstream m_file;
 
 private:
-    static std::ofstream open(const std::filesystem::path& path) {
-        if (path.has_parent_path())
-            std::filesystem::create_directories(path.parent_path());
+    static std::ofstream open(const std::filesystem::path& path, FileMode fileMode) {
+        std::error_code ec;
+        if (path.has_parent_path() && !std::filesystem::create_directories(path.parent_path(), ec) && ec) {
+            throw std::runtime_error(
+                std::format("FileSink: failed to create directory '{}': {}", path.parent_path().string(), ec.message())
+            );
+        }
 
-        std::ofstream file(path);
+        auto openMode = std::ios::out;
+
+        switch (fileMode) {
+        case FileMode::Append:
+            openMode |= std::ios::app;
+            break;
+        case FileMode::Truncate:
+            openMode |= std::ios::trunc;
+            break;
+        }
+        std::ofstream file(path, openMode);
+
         if (!file.is_open())
             throw std::runtime_error(std::format("FileSink: failed to open '{}'", path.string()));
 
         return file;
     }
 
-    std::ofstream m_file;
+public:
+    explicit FileSink(const std::filesystem::path& path, FileMode fileMode = FileMode::Truncate, LogFormat format = {})
+        : LogSink(std::move(format)), m_fileMode(fileMode), m_file(open(path, m_fileMode)) {}
+
+    void write(const LogMessage& message) override {
+        std::print(m_file, "{}", render(message, resolveColor(false)));
+        m_file.flush();
+    }
 };
 
 class CallbackSink final : public LogSink {
 public:
     using Callback = std::function<void(const LogMessage&, std::string)>;
 
+private:
+    Callback m_callback;
+
+public:
     explicit CallbackSink(Callback callback, LogFormat format = {})
         : LogSink(std::move(format)), m_callback(std::move(callback)) {}
 
     void write(const LogMessage& message) override {
-        // Additionally supply the rendered message - we have no idea how message will be used
-        m_callback(message, render(message));
+        // Additionally supply the rendered message - we have no idea how the message will be used
+        m_callback(message, render(message, resolveColor(false)));
     }
-
-private:
-    Callback m_callback;
 };
 
 class Log {
+private:
+    static inline std::vector<std::unique_ptr<LogSink>> m_sinks;
+
 public:
     Log() = delete;
 
@@ -204,9 +348,6 @@ public:
             sink->write(message);
         //}
     }
-
-private:
-    static inline std::vector<std::unique_ptr<LogSink>> m_sinks;
 };
 
 } // namespace tinlog
@@ -214,37 +355,38 @@ private:
 // Each macro supplies source_location::current() explicitly, evaluated at
 // the call site, then forwards the format string + args straight through.
 #if TINLOG_LEVEL <= TINLOG_LEVEL_TRACE
-#define TINLOG_TRACE(...) tinlog::Log::write<TINLOG_LEVEL_TRACE>(std::source_location::current(), __VA_ARGS__)
+#define TINLOG_TRACE(...) tinlog::Log::write<tinlog::LogLevel::Trace>(std::source_location::current(), __VA_ARGS__)
 #else
 #define TINLOG_TRACE(...) (void)0
 #endif
 
 #if TINLOG_LEVEL <= TINLOG_LEVEL_DEBUG
-#define TINLOG_DEBUG(...) tinlog::Log::write<TINLOG_LEVEL_DEBUG>(std::source_location::current(), __VA_ARGS__)
+#define TINLOG_DEBUG(...) tinlog::Log::write<tinlog::LogLevel::Debug>(std::source_location::current(), __VA_ARGS__)
 #else
 #define TINLOG_DEBUG(...) (void)0
 #endif
 
 #if TINLOG_LEVEL <= TINLOG_LEVEL_INFO
-#define TINLOG_INFO(...) tinlog::Log::write<TINLOG_LEVEL_INFO>(std::source_location::current(), __VA_ARGS__)
+#define TINLOG_INFO(...) tinlog::Log::write<tinlog::LogLevel::Info>(std::source_location::current(), __VA_ARGS__)
 #else
 #define TINLOG_INFO(...) (void)0
 #endif
 
 #if TINLOG_LEVEL <= TINLOG_LEVEL_WARN
-#define TINLOG_WARN(...) tinlog::Log::write<TINLOG_LEVEL_WARN>(std::source_location::current(), __VA_ARGS__)
+#define TINLOG_WARN(...) tinlog::Log::write<tinlog::LogLevel::Warn>(std::source_location::current(), __VA_ARGS__)
 #else
 #define TINLOG_WARN(...) (void)0
 #endif
 
 #if TINLOG_LEVEL <= TINLOG_LEVEL_ERROR
-#define TINLOG_ERROR(...) tinlog::Log::write<TINLOG_LEVEL_ERROR>(std::source_location::current(), __VA_ARGS__)
+#define TINLOG_ERROR(...) tinlog::Log::write<tinlog::LogLevel::Error>(std::source_location::current(), __VA_ARGS__)
 #else
 #define TINLOG_ERROR(...) (void)0
 #endif
 
 #if TINLOG_LEVEL <= TINLOG_LEVEL_CRITICAL
-#define TINLOG_CRITICAL(...) tinlog::Log::write<TINLOG_LEVEL_CRITICAL>(std::source_location::current(), __VA_ARGS__)
+#define TINLOG_CRITICAL(...)                                                                                           \
+    tinlog::Log::write<tinlog::LogLevel::Critical>(std::source_location::current(), __VA_ARGS__)
 #else
 #define TINLOG_CRITICAL(...) (void)0
 #endif
