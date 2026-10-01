@@ -16,6 +16,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
+#include <iterator>
 #include <vector>
 
 #if defined(_WIN32)
@@ -24,24 +27,6 @@
 #include <unistd.h>
 #endif
 #include <cstdlib>
-
-namespace color_details {
-// Resolving env and adopting NO_COLOR for the terminal sinc
-// and maybe other streams
-inline bool autoColorFor(std::FILE* f) {
-    // https://no-color.org: present and non-empty disables color
-    if (const char* nc = std::getenv("NO_COLOR"); nc && *nc)
-        return false;
-    // check for term
-    if (const char* term = std::getenv("TERM"); term && std::string_view(term) == "dumb")
-        return false;
-#if defined(_WIN32)
-    return _isatty(_fileno(f)) != 0;
-#else
-    return isatty(fileno(f)) != 0;
-#endif
-}
-} // namespace color_details
 
 // We still have to define the numerical representation of each level manually,
 // since we want to have preprocessor taking care of call sites definitions
@@ -74,6 +59,24 @@ inline bool autoColorFor(std::FILE* f) {
 
 // TODO: threading, thread safety
 namespace tinlog {
+
+namespace color_details {
+// Resolving env and adopting NO_COLOR for the terminal sink
+// and maybe other streams
+inline bool autoColorFor(std::FILE* f) {
+    // https://no-color.org: present and non-empty disables color
+    if (const char* nc = std::getenv("NO_COLOR"); nc && *nc)
+        return false;
+    // check for term
+    if (const char* term = std::getenv("TERM"); term && std::string_view(term) == "dumb")
+        return false;
+#if defined(_WIN32)
+    return _isatty(_fileno(f)) != 0;
+#else
+    return isatty(fileno(f)) != 0;
+#endif
+}
+} // namespace color_details
 
 enum class LogLevel : std::uint8_t {
 #define X(id, ID, NUM, name, color) id = NUM,
@@ -160,19 +163,43 @@ struct LogFormat {
 };
 
 class LogSink {
-public:
-    explicit LogSink(LogFormat format = {}) : m_format(std::move(format)) {}
-    virtual ~LogSink() = default;
+private:
+    enum Field {
+        Timestamp,
+        Source,
+        Pattern,
+        // Sentilel
+        FieldCount
+    };
+    static constexpr std::array<std::string_view, FieldCount> kFieldNames = { "timestampFormat",
+                                                                              "sourceFormat",
+                                                                              "pattern" };
+    std::array<std::string, FieldCount> m_reportedFmtFields;
 
-    virtual void write(const LogMessage& message) = 0;
+private:
+    template <typename Fn>
+    std::string
+    guardedFormat(Field field, const std::string& spec, std::string& notices, Fn&& fn, std::string_view fallback = {}) {
+        try {
+            return fn();
+        } catch (const std::format_error& e) {
+            if (m_reportedFmtFields[field] != spec) {
+                m_reportedFmtFields[field] = spec;
+                std::format_to(
+                    std::back_inserter(notices),
+                    "[tinlog] invalid {} '{}': {}{}",
+                    kFieldNames[field],
+                    spec,
+                    e.what(),
+                    m_format.terminator
+                );
+            }
+            return std::string(fallback);
+        }
+    }
 
-    // Post-construction tuning, e.g.: sink->format().timestampFormat = "%Y-%m-%d %H:%M:%S";
-    LogFormat& format() {
-        return m_format;
-    }
-    const LogFormat& format() const {
-        return m_format;
-    }
+protected:
+    LogFormat m_format;
 
 protected:
     // autoValue: what Auto means for the target about to be written to
@@ -189,35 +216,63 @@ protected:
     }
 
     // We have several overrides for the color
-    // env vars such as NO_COLOR - will set autoValue for the color to false for teminal depending on the stream and evn
-    // characteristics. overrides per sink two levers ColorMode::Always/Never - user controlled - ignore all the
+    // env vars such as NO_COLOR - will set autoValue for the color to false for terminal depending on the stream and
+    // env characteristics. overrides per sink two levers ColorMode::Always/Never - user controlled - ignore all the
     // resolving logic.
-    std::string render(const LogMessage& msg, bool useColor) const {
+    std::string render(const LogMessage& msg, bool useColor) {
         std::string_view color = useColor ? getLevelColor(msg.level) : std::string_view {};
         std::string_view reset = useColor ? colorReset() : std::string_view {};
         std::string_view levelName = getLevelName(msg.level);
+        std::string fmtValidationMsgs;
 
         auto timestamp = std::chrono::floor<std::chrono::milliseconds>(msg.timestamp);
-        // Convert timestamp to current zone
         auto zonedTimestamp = std::chrono::zoned_time { m_format.timeZone, timestamp };
         std::string renderedTimestamp =
-            std::vformat("{:" + m_format.timestampFormat + "}", std::make_format_args(zonedTimestamp));
+            guardedFormat(Field::Timestamp, m_format.timestampFormat, fmtValidationMsgs, [&] {
+                return std::vformat("{:" + m_format.timestampFormat + "}", std::make_format_args(zonedTimestamp));
+            });
 
         auto sourceFileName = msg.location.file_name();
         auto sourceLine = msg.location.line();
         auto sourceFunctionName = msg.location.function_name();
-        std::string renderedSource =
-            std::vformat(m_format.sourceFormat, std::make_format_args(sourceFileName, sourceLine, sourceFunctionName));
+        std::string renderedSource = guardedFormat(Field::Source, m_format.sourceFormat, fmtValidationMsgs, [&] {
+            return std::vformat(
+                m_format.sourceFormat,
+                std::make_format_args(sourceFileName, sourceLine, sourceFunctionName)
+            );
+        });
 
-        auto out = std::vformat(
+        std::string out = guardedFormat(
+            Field::Pattern,
             m_format.pattern,
-            std::make_format_args(color, renderedTimestamp, levelName, msg.rawMessage, reset, renderedSource)
+            fmtValidationMsgs,
+            [&] {
+                return std::vformat(
+                    m_format.pattern,
+                    std::make_format_args(color, renderedTimestamp, levelName, msg.rawMessage, reset, renderedSource)
+                );
+            },
+            msg.rawMessage // fallback
         );
+
         out += m_format.terminator;
+        out += fmtValidationMsgs;
         return out;
     }
 
-    LogFormat m_format;
+public:
+    explicit LogSink(LogFormat format = {}) : m_format(std::move(format)) {}
+    virtual ~LogSink() = default;
+
+    virtual void write(const LogMessage& message) = 0;
+
+    // Post-construction tuning, e.g.: sink->format().timestampFormat = "%Y-%m-%d %H:%M:%S";
+    LogFormat& format() {
+        return m_format;
+    }
+    const LogFormat& format() const {
+        return m_format;
+    }
 };
 
 class TerminalSink final : public LogSink {
@@ -240,7 +295,7 @@ public:
     void write(const LogMessage& message) override {
         const bool toErr = message.level >= m_stderrThreshold;
         if (toErr)
-            // avoid missalingment between buffered stdout and unbeffered stderr
+            // avoid misalignment between buffered stdout and unbuffered stderr
             std::fflush(stdout);
         std::print(toErr ? stderr : stdout, "{}", render(message, resolveColor(toErr ? m_errColor : m_outColor)));
     }
