@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(tinlog VERSION 0.1.0 LANGUAGES CXX)
+project(tinlog VERSION 0.2.0 LANGUAGES CXX)
 
 add_library(tinlog INTERFACE)
 

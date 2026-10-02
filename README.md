@@ -9,6 +9,7 @@ Runtime-configurable formatting, multiple independent sinks, terminal colors, so
 - Header-only - one file, `#include` and go.
 - Compile-time level filtering via `TINLOG_LEVEL` - disabled levels compile to nothing.
 - Per-sink formatting: timestamp, source location, colors, and overall message layout.
+- Per-level overrides for every formatting part (e.g. a different pattern or color mode for `Error`)
 - Built-in sinks:
   - `TerminalSink` - stdout/stderr routing with automatic terminal color detection.
   - `FileSink` - file output with truncate or append modes.
@@ -114,6 +115,7 @@ Color behavior can be overridden per sink:
 ```cpp
 terminal->format().color = tinlog::ColorMode::Always;
 ```
+Color mode can also be overridden per level, see [Formatting](#formatting).
 
 Available modes are:
 
@@ -158,7 +160,9 @@ auto* cb = tinlog::Log::addSink<tinlog::CallbackSink>(
 
 ### Formatting
 
-Every sink exposes a mutable `LogFormat` through `sink->format()`.
+Every sink exposes a mutable `LogFormat` through `sink->format()`. Each part is a
+`LevelOverridable<T>`: one base value for the sink, plus an optional override per level.
+Plain assignment sets the base value.
 
 ```cpp
 sink->format().timestampFormat = "%Y-%m-%d %H:%M:%S";
@@ -166,11 +170,19 @@ sink->format().sourceFormat    = "{0}:{1}";
 sink->format().pattern         = "{0}[{1}] [{2}] {3}{4} ({5})";
 ```
 
-The `sourceFormat` arguments are:
+| Part              | Type     | Notes                                                    |
+|-------------------|----------|----------------------------------------------------------|
+| `color`           | `ColorMode` | `Auto` by default                                     |
+| `timestampFormat` | string   | chrono format spec, timestamp floored to milliseconds    |
+| `sourceFormat`    | string   | `{0}` file, `{1}` line, `{2}` function                   |
+| `pattern`         | string   | final assembly, see below                                |
+| `terminator`      | string   | appended after the pattern, defaults to `"\n"`           |
 
-- `{0}` - source file
-- `{1}` - line
-- `{2}` - function
+`timeZone` is a plain per-sink setting (not overridable per level):
+
+```cpp
+sink->format().timeZone = std::chrono::locate_zone("Europe/Kyiv");
+```
 
 The `pattern` arguments are:
 
@@ -181,17 +193,43 @@ The `pattern` arguments are:
 - `{4}` - color reset escape
 - `{5}` - rendered source location
 
-The color escape and color reset escape are dependent on user specified color settings or Auto mode.
+The color escapes are empty when color is disabled by `ColorMode` or by `Auto` detection.
 
-The timestamp is floored to milliseconds by default.
+#### Per-level overrides
 
-The time zone can be changed per sink:
+Any part can be overridden for individual levels. A level without an override inherits the
+base value, and changing the base later keeps propagating to those levels.
 
 ```cpp
-sink->format().timeZone = std::chrono::locate_zone("Europe/Kyiv");
+sink->format().pattern
+    .setOverrideForLevel(LogLevel::Error,    "{0}!! {2} !!{4} {3} <{5}>")
+    .setOverrideForLevel(LogLevel::Critical, "{0}!!! {2} !!! {3}{4} <{5}>");
+
+sink->format().color
+    .setBaseValue(ColorMode::Never)
+    .setOverrideForLevel(LogLevel::Warn, ColorMode::Always);
+
+// inherit the base again
+sink->format().pattern.clearOverrideForLevel(LogLevel::Error);
 ```
 
-`terminator` is appended after the rendered pattern and defaults to `"\n"`.
+| Method                               | Effect                                              |
+|--------------------------------------|-----------------------------------------------------|
+| `setBaseValue(v)` / `= v`            | sets the base, leaves overrides untouched           |
+| `setOverrideForLevel(level, v)`      | sets the override for one level                     |
+| `clearOverrideForLevel(level)`       | removes it, the level inherits the base             |
+| `hasOverrideForLevel(level)`         | true if an override is set                          |
+| `resolveForLevel(level)`             | effective value (override if set, else base)        |
+| `baseValue()`                        | the base value                                      |
+
+The setters return `*this`, so calls chain. `LogLevel::Off` is a threshold, not a message
+level: passing it to any of these throws `std::out_of_range`.
+
+#### Invalid format specs
+
+A bad spec never throws from a log call. A failing timestamp or source part renders empty,
+a failing `pattern` falls back to the raw message, and a `[tinlog] invalid ...` fmt validation message is appended to the output. Consecutive repeats of the same bad spec for the same part are
+reported once, *unless the error or the level alternate*.
 
 ## License
 
