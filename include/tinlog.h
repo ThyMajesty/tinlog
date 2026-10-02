@@ -1,24 +1,26 @@
 #pragma once
 
 #include <array>
-#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
+#include <optional>
 #include <print>
+#include <set>
 #include <source_location>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <iterator>
 #include <vector>
 
 #if defined(_WIN32)
@@ -26,7 +28,6 @@
 #else
 #include <unistd.h>
 #endif
-#include <cstdlib>
 
 // We still have to define the numerical representation of each level manually,
 // since we want to have preprocessor taking care of call sites definitions
@@ -39,7 +40,7 @@
 // Sentinel
 #define TINLOG_LEVEL_OFF 6
 
-// X(id, ID, NUM, name, color) - utility for enum typecheck, names and colors
+// X(id, ID(unused for now), NUM, name, color) - utility for enum typecheck, names and colors
 #define TINLOG_LEVELS(X)                                                                                               \
     X(Trace, TRACE, TINLOG_LEVEL_TRACE, "TRACE", "\033[90m")                                                           \
     X(Debug, DEBUG, TINLOG_LEVEL_DEBUG, "DEBUG", "\033[36m")                                                           \
@@ -88,11 +89,11 @@ enum class LogLevel : std::uint8_t {
 
 // We rely on sentinel being the last element of each representation
 // Check the enumeration consistency, not needed tbh...
-inline constexpr size_t kLevelCount = static_cast<size_t>(LogLevel::Off);
+inline constexpr std::size_t kLevelCount = static_cast<std::size_t>(LogLevel::Off);
 constexpr bool levelsAreDense() {
-    size_t i = 0;
+    std::size_t i = 0;
     bool ok = true;
-#define X(id, ID, NUM, name, color) ok = ok && (static_cast<size_t>(NUM) == i++);
+#define X(id, ID, NUM, name, color) ok = ok && (static_cast<std::size_t>(NUM) == i++);
     TINLOG_LEVELS(X)
 #undef X
     return ok;
@@ -112,15 +113,16 @@ inline constexpr std::array<std::string_view, kLevelCount> kDefaultColors = {
 #undef X
 };
 
-constexpr size_t lvl2idx(LogLevel lvl) {
-    assert(lvl < LogLevel::Off && "invalid LogLevel");
-    return static_cast<size_t>(lvl);
+constexpr std::size_t levelToIndex(LogLevel level) {
+    if (level >= LogLevel::Off)
+        throw std::out_of_range("tinlog: LogLevel::Off has no per-level slot");
+    return static_cast<std::size_t>(level);
 }
-constexpr std::string_view getLevelName(LogLevel lvl) {
-    return kDefaultNames[lvl2idx(lvl)];
+constexpr std::string_view getLevelName(LogLevel level) {
+    return kDefaultNames[levelToIndex(level)];
 }
-constexpr std::string_view getLevelColor(LogLevel lvl) {
-    return kDefaultColors[lvl2idx(lvl)];
+constexpr std::string_view getLevelColor(LogLevel level) {
+    return kDefaultColors[levelToIndex(level)];
 }
 constexpr std::string_view colorReset() {
     return "\033[0m";
@@ -135,18 +137,77 @@ struct LogMessage {
 
 enum class ColorMode : std::uint8_t { Never, Always, Auto };
 
-// Per-sink formatting config
+// A value of type ValueType with one base value plus an optional override per LogLevel.
+// Lookup for a level returns its override if one is set, otherwise the base value.
+template <typename ValueType>
+class LevelOverridable {
+private:
+    // Used whenever a level has no override.
+    ValueType m_baseValue {};
+
+    // Indexed by levelToIndex(level). An empty optional means "inherit the base value".
+    // Sized by kLevelCount (excludes the Off sentinel), so Off can't be indexed.
+    std::array<std::optional<ValueType>, kLevelCount> m_perLevelOverrides;
+
+public:
+    LevelOverridable() = default;
+
+    // Still works with `LevelOverridable<X> member { value };` in-class init.
+    explicit LevelOverridable(ValueType baseValue) : m_baseValue(std::move(baseValue)) {}
+
+    // Sugar for `format.pattern = "..."` to set the base value. Does NOT touch any per-level overrides;
+    // return *this; - returning the object for chaining;
+    LevelOverridable& operator=(ValueType newBaseValue) {
+        return setBaseValue(std::move(newBaseValue));
+    }
+
+    LevelOverridable& setBaseValue(ValueType newBaseValue) {
+        m_baseValue = std::move(newBaseValue);
+        return *this;
+    }
+
+    // Assigning into the optional engages it. This replaces any previous override.
+    LevelOverridable& setOverrideForLevel(LogLevel level, ValueType overrideValue) {
+        m_perLevelOverrides[levelToIndex(level)] = std::move(overrideValue);
+        return *this;
+    }
+
+    // Disengages the optional: the level goes back to inheriting the base value.
+    LevelOverridable& clearOverrideForLevel(LogLevel level) {
+        m_perLevelOverrides[levelToIndex(level)].reset();
+        return *this;
+    }
+
+    // True only if an override is explicitly set. Says nothing about the effective value.
+    bool hasOverrideForLevel(LogLevel level) const {
+        return m_perLevelOverrides[levelToIndex(level)].has_value();
+    }
+
+    // The effective value for a level: override if engaged, else base.
+    // Returns a reference, so it's only valid until the next set/clear/assign.
+    // Don't hold it across a mutation.
+    const ValueType& resolveForLevel(LogLevel level) const {
+        const std::optional<ValueType>& levelOverride = m_perLevelOverrides[levelToIndex(level)];
+        // operator bool on optional = has_value(); *levelOverride unwraps it with no copy
+        return levelOverride ? *levelOverride : m_baseValue;
+    }
+
+    const ValueType& baseValue() const {
+        return m_baseValue;
+    }
+};
+
+// Per-sink and per-level formatting config
+// Every part is a LevelOverridable: base per sink, optional override per level.
 // TODO: timestamp flooring to a specified precision instead of milliseconds (std::chrono::seconds, ..)
 struct LogFormat {
-    ColorMode color = ColorMode::Auto;
+    LevelOverridable<ColorMode> color { ColorMode::Auto };
 
     // chrono format spec, applied to the timestamp floored to milliseconds.
-    std::string timestampFormat = "%Y-%m-%d %H:%M:%S";
-    // cached timeZone - can be changed on the call site
-    const std::chrono::time_zone* timeZone = std::chrono::current_zone();
+    LevelOverridable<std::string> timestampFormat { "%Y-%m-%d %H:%M:%S" };
 
     // Positional: {0} file, {1} line, {2} function.
-    std::string sourceFormat = "File: {0} {2}:{1}";
+    LevelOverridable<std::string> sourceFormat { "File: {0} {2}:{1}" };
 
     // Final assembly. Positional args are *already-rendered* pieces:
     //   {0} color escape (empty if color is disabled by ColorMode/env)
@@ -155,56 +216,63 @@ struct LogFormat {
     //   {3} user message
     //   {4} color reset escape (empty if color is disabled by ColorMode/env)
     //   {5} rendered source
-    std::string pattern = "{0}[{1}] [{2:^5}] {3}{4} ({5})";
+    LevelOverridable<std::string> pattern { "{0}[{1}] [{2:^5}] {3}{4} ({5})" };
 
     // Appended after the rendered pattern. Not a part of the pattern, so
     // it never goes through std::vformat.
-    std::string terminator = "\n";
+    LevelOverridable<std::string> terminator { "\n" };
+
+    // cached timeZone - can be changed on the call site
+    const std::chrono::time_zone* timeZone = std::chrono::current_zone();
 };
 
 class LogSink {
 private:
-    enum Field {
-        Timestamp,
-        Source,
+    enum class FieldName : std::uint8_t {
+        TimestampFormat,
+        SourceFormat,
         Pattern,
-        // Sentilel
+        // Sentinel
         FieldCount
     };
-    static constexpr std::array<std::string_view, FieldCount> kFieldNames = { "timestampFormat",
-                                                                              "sourceFormat",
-                                                                              "pattern" };
-    std::array<std::string, FieldCount> m_reportedFmtFields;
+    static constexpr std::array<std::string_view, static_cast<std::size_t>(FieldName::FieldCount)> kFieldNames = {
+        "timestampFormat",
+        "sourceFormat",
+        "pattern"
+    };
+    // dumb dedupe - guard same error for the same field does not emit consecutively
+    std::array<std::string, static_cast<std::size_t>(FieldName::FieldCount)> m_reportedFmt;
 
 private:
     template <typename Fn>
-    std::string
-    guardedFormat(Field field, const std::string& spec, std::string& notices, Fn&& fn, std::string_view fallback = {}) {
+    std::string guardedFormat(
+        FieldName fieldName,
+        const std::string& spec,
+        std::string& fmtValidationMsgs,
+        Fn&& fn,
+        std::string_view fallback = {}
+    ) {
         try {
             return fn();
         } catch (const std::format_error& e) {
-            if (m_reportedFmtFields[field] != spec) {
-                m_reportedFmtFields[field] = spec;
+            auto idx = static_cast<std::size_t>(fieldName);
+            if (m_reportedFmt[idx] != spec) {
+                m_reportedFmt[idx] = spec;
                 std::format_to(
-                    std::back_inserter(notices),
-                    "[tinlog] invalid {} '{}': {}{}",
-                    kFieldNames[field],
+                    std::back_inserter(fmtValidationMsgs),
+                    "[tinlog] invalid {} '{}': {}\n",
+                    kFieldNames[static_cast<std::size_t>(fieldName)],
                     spec,
-                    e.what(),
-                    m_format.terminator
+                    e.what()
                 );
             }
             return std::string(fallback);
         }
     }
 
-protected:
-    LogFormat m_format;
-
-protected:
     // autoValue: what Auto means for the target about to be written to
-    bool resolveColor(bool autoValue) const {
-        switch (m_format.color) {
+    bool resolveColor(bool autoValue, LogLevel level) const {
+        switch (m_format.color.resolveForLevel(level)) {
         case ColorMode::Always:
             return true;
         case ColorMode::Auto:
@@ -215,47 +283,51 @@ protected:
         return false;
     }
 
-    // We have several overrides for the color
-    // env vars such as NO_COLOR - will set autoValue for the color to false for terminal depending on the stream and
-    // env characteristics. overrides per sink two levers ColorMode::Always/Never - user controlled - ignore all the
-    // resolving logic.
-    std::string render(const LogMessage& msg, bool useColor) {
-        std::string_view color = useColor ? getLevelColor(msg.level) : std::string_view {};
+protected:
+    LogFormat m_format;
+
+protected:
+    // Auto color is decided per target (autoValue);
+    // ColorMode::Always/Never on the format overrides it;
+    // Env vars like NO_COLOR only affect autoValue.
+    std::string render(const LogMessage& msg, bool autoValue) {
+        LogLevel level = msg.level;
+        const bool useColor = resolveColor(autoValue, level);
+        std::string_view color = useColor ? getLevelColor(level) : std::string_view {};
         std::string_view reset = useColor ? colorReset() : std::string_view {};
-        std::string_view levelName = getLevelName(msg.level);
+        std::string_view levelName = getLevelName(level);
         std::string fmtValidationMsgs;
 
         auto timestamp = std::chrono::floor<std::chrono::milliseconds>(msg.timestamp);
         auto zonedTimestamp = std::chrono::zoned_time { m_format.timeZone, timestamp };
+        const auto& timestampFormat = m_format.timestampFormat.resolveForLevel(level);
         std::string renderedTimestamp =
-            guardedFormat(Field::Timestamp, m_format.timestampFormat, fmtValidationMsgs, [&] {
-                return std::vformat("{:" + m_format.timestampFormat + "}", std::make_format_args(zonedTimestamp));
+            guardedFormat(FieldName::TimestampFormat, timestampFormat, fmtValidationMsgs, [&] {
+                return std::vformat("{:" + timestampFormat + "}", std::make_format_args(zonedTimestamp));
             });
 
         auto sourceFileName = msg.location.file_name();
         auto sourceLine = msg.location.line();
         auto sourceFunctionName = msg.location.function_name();
-        std::string renderedSource = guardedFormat(Field::Source, m_format.sourceFormat, fmtValidationMsgs, [&] {
-            return std::vformat(
-                m_format.sourceFormat,
-                std::make_format_args(sourceFileName, sourceLine, sourceFunctionName)
-            );
+        const auto& sourceFormat = m_format.sourceFormat.resolveForLevel(level);
+        std::string renderedSource = guardedFormat(FieldName::SourceFormat, sourceFormat, fmtValidationMsgs, [&] {
+            return std::vformat(sourceFormat, std::make_format_args(sourceFileName, sourceLine, sourceFunctionName));
         });
-
+        const auto& pattern = m_format.pattern.resolveForLevel(level);
         std::string out = guardedFormat(
-            Field::Pattern,
-            m_format.pattern,
+            FieldName::Pattern,
+            pattern,
             fmtValidationMsgs,
             [&] {
                 return std::vformat(
-                    m_format.pattern,
+                    pattern,
                     std::make_format_args(color, renderedTimestamp, levelName, msg.rawMessage, reset, renderedSource)
                 );
             },
             msg.rawMessage // fallback
         );
 
-        out += m_format.terminator;
+        out += m_format.terminator.resolveForLevel(level);
         out += fmtValidationMsgs;
         return out;
     }
@@ -288,8 +360,8 @@ public:
 
     // Messages with level >= threshold go to stderr, the rest to stdout.
     // LogLevel::Off = everything to stdout, LogLevel::Trace = everything to stderr.
-    void setStderrThreshold(LogLevel lvl) {
-        m_stderrThreshold = lvl;
+    void setStderrThreshold(LogLevel level) {
+        m_stderrThreshold = level;
     }
 
     void write(const LogMessage& message) override {
@@ -297,7 +369,7 @@ public:
         if (toErr)
             // avoid misalignment between buffered stdout and unbuffered stderr
             std::fflush(stdout);
-        std::print(toErr ? stderr : stdout, "{}", render(message, resolveColor(toErr ? m_errColor : m_outColor)));
+        std::print(toErr ? stderr : stdout, "{}", render(message, toErr ? m_errColor : m_outColor));
     }
 };
 
@@ -345,7 +417,7 @@ public:
         : LogSink(std::move(format)), m_fileMode(fileMode), m_file(open(path, m_fileMode)) {}
 
     void write(const LogMessage& message) override {
-        std::print(m_file, "{}", render(message, resolveColor(false)));
+        std::print(m_file, "{}", render(message, false));
         m_file.flush();
     }
 };
@@ -363,13 +435,13 @@ public:
 
     void write(const LogMessage& message) override {
         // Additionally supply the rendered message - we have no idea how the message will be used
-        m_callback(message, render(message, resolveColor(false)));
+        m_callback(message, render(message, false));
     }
 };
 
 class Log {
 private:
-    static inline std::vector<std::unique_ptr<LogSink>> m_sinks;
+    static inline std::vector<std::unique_ptr<LogSink>> s_sinks;
 
 public:
     Log() = delete;
@@ -378,16 +450,17 @@ public:
     static SinkT* addSink(Args&&... args) {
         auto sink = std::make_unique<SinkT>(std::forward<Args>(args)...);
         SinkT* ptr = sink.get();
-        m_sinks.push_back(std::move(sink));
+        s_sinks.push_back(std::move(sink));
         return ptr;
     }
 
     static void removeSink(LogSink* sink) {
-        std::erase_if(m_sinks, [sink](const auto& s) { return s.get() == sink; });
+        std::erase_if(s_sinks, [sink](const auto& s) { return s.get() == sink; });
     }
 
     template <LogLevel Level, typename... Args>
     static void write(std::source_location location, std::format_string<Args...> fmt, Args&&... args) {
+        static_assert(Level < LogLevel::Off, "Off is a threshold, not a message level");
         // if constexpr (static_cast<int>(Level) >= TINLOG_LEVEL) {
         auto now = std::chrono::system_clock::now();
         std::string rawMessage = std::format(fmt, std::forward<Args>(args)...);
@@ -399,7 +472,7 @@ public:
             .timestamp = now,
         };
 
-        for (auto& sink : m_sinks)
+        for (auto& sink : s_sinks)
             sink->write(message);
         //}
     }

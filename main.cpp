@@ -161,20 +161,88 @@ void demoSinks() {
     std::println("see logs/truncate.log and logs/append.log (run twice: append grows)");
 }
 
+void demoLevelOverrides() {
+    section("per-level overrides");
+    auto* sink = Log::addSink<TerminalSink>();
+
+    // Base applies to every level without an override
+    sink->format().pattern = "{0}{2:<5}{4} | {3}";
+    sink->format().sourceFormat = "{1}";
+    TINLOG_INFO("base pattern");
+    TINLOG_WARN("base pattern");
+
+    // Chained overrides: only Error and Critical change, the rest keep inheriting
+    sink->format().pattern.clearOverrideForLevel(LogLevel::Critical).setBaseValue("[{1}] {2:<5} {3}");
+    sink->format()
+        .pattern.setOverrideForLevel(LogLevel::Error, "{0}!! {2} !!{4} {3} <{5}>")
+        .setOverrideForLevel(LogLevel::Critical, "{0}!!! {2} !!! {3}{4} <{5}>");
+    // Source part overridden separately: Critical also gets file and function
+    sink->format().sourceFormat.setOverrideForLevel(LogLevel::Critical, "{0}:{1} in {2}");
+    TINLOG_INFO("unchanged");
+    TINLOG_ERROR("overridden pattern");
+    TINLOG_CRITICAL("overridden pattern + source");
+
+    // Base change propagates to non-overridden levels only
+    sink->format().pattern = "{0}{2:<5}{4} >> {3}";
+    TINLOG_INFO("base changed, follows it");
+    TINLOG_ERROR("base changed, Error keeps its override");
+
+    // Color: off for everything, forced on only for Warn/Error.
+    // Always ignores NO_COLOR and redirects, so this shows even in a pipe.
+    sink->format()
+        .color.setBaseValue(ColorMode::Never)
+        .setOverrideForLevel(LogLevel::Warn, ColorMode::Always)
+        .setOverrideForLevel(LogLevel::Error, ColorMode::Always);
+    TINLOG_INFO("no color");
+    TINLOG_WARN("colored");
+    TINLOG_ERROR("colored");
+
+    // Per-level timestamp and terminator
+    sink->format().pattern = "[{1}] {2:<5} {3}";
+    sink->format()
+        .timestampFormat.setBaseValue("%H:%M:%S")
+        .setOverrideForLevel(LogLevel::Critical, "%Y-%m-%d %H:%M:%S");
+    sink->format().terminator.setOverrideForLevel(LogLevel::Critical, "\n---\n");
+    TINLOG_INFO("short time");
+    TINLOG_CRITICAL("full date, separator after");
+
+    // Query, then clear: Error goes back to inheriting the base pattern
+    std::println(
+        "Error pattern overridden: {}, Info: {}",
+        sink->format().pattern.hasOverrideForLevel(LogLevel::Error),
+        sink->format().pattern.hasOverrideForLevel(LogLevel::Info)
+    );
+    sink->format().pattern.clearOverrideForLevel(LogLevel::Error);
+    sink->format().color.clearOverrideForLevel(LogLevel::Error);
+    TINLOG_ERROR("Error is back on the base format");
+
+    Log::removeSink(sink);
+}
+
 // Deliberate throw
 void demoBadFormat() {
     section("invalid specs fall back instead of throwing");
     auto* sink = Log::addSink<TerminalSink>();
 
     // no argument 66
-    sink->format().pattern = "{0}[{1}] {66}{4}"; 
+    sink->format().pattern = "{0}[{1}] {66}{4}";
     TINLOG_INFO("raw message + one notice");
     TINLOG_INFO("same bad pattern: no second notice");
 
     sink->format().pattern = "[{1}] {3}";
     // only valid for durations
-    sink->format().timestampFormat = "%Q"; 
+    sink->format().timestampFormat = "%Q";
     TINLOG_INFO("timestamp renders empty, rest intact");
+
+    sink->format().pattern = "{66}";
+    sink->format().pattern.setOverrideForLevel(LogLevel::Error, "{77}");
+    for (int i = 0; i < 3; ++i) {
+        // notice only the first time for the same message and Level
+        TINLOG_INFO("base bad");
+        TINLOG_INFO("base bad");
+        
+        TINLOG_ERROR("level bad");
+    }
 
     Log::removeSink(sink);
 }
@@ -199,6 +267,7 @@ int main() {
     demoStreams();
     demoColor();
     demoFormatting();
+    demoLevelOverrides();
     demoTerminator();
     demoSinks();
     // Deliberate throws
